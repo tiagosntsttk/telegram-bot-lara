@@ -8,7 +8,7 @@ from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
 
-# ─── CONFIGURAÇÃO DE LOGS (Veja isso no painel do Railway) ───
+# ─── CONFIGURAÇÃO DE LOGS ───
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -16,79 +16,115 @@ logger = logging.getLogger(__name__)
 TOKEN_BOT = os.getenv("TOKEN_BOT")
 CHAVE_GEMINI = os.getenv("CHAVE_GEMINI")
 
+if not TOKEN_BOT or not CHAVE_GEMINI:
+    logger.error("❌ TOKEN_BOT ou CHAVE_GEMINI não configurados no Railway!")
+    exit(1)
+
 genai.configure(api_key=CHAVE_GEMINI)
 
-# ─── CACHE DE SESSÕES ───
+# ─── CACHE DE SESSÕES (com limite de tamanho) ───
 historico_conversas = OrderedDict()
+MAX_SESSOES = 100  # Limite de usuários simultâneos em memória
 
-def verificar_assinatura(user_id):
-    if not os.path.exists("membros.txt"):
+def verificar_assinatura(user_id: int) -> bool:
+    try:
+        if not os.path.exists("membros.txt"):
+            return False
+        with open("membros.txt", "r") as f:
+            membros = f.read().splitlines()
+        return str(user_id) in membros
+    except Exception as e:
+        logger.error(f"Erro ao ler membros.txt: {e}")
         return False
-    with open("membros.txt", "r") as f:
-        membros = f.read().splitlines()
-    return str(user_id) in membros
 
 async def simular_digitacao(update: Update, context: ContextTypes.DEFAULT_TYPE, texto: str):
-    # Delay de visualização (1 a 3 segundos)
-    await asyncio.sleep(random.uniform(1, 3))
+    await asyncio.sleep(random.uniform(1.0, 2.8))
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-    # Tempo de digitação proporcional ao texto
-    tempo = max(1.5, min(len(texto) * 0.07, 6.5))
+    tempo = max(1.2, min(len(texto) * 0.065, 7.0))
     await asyncio.sleep(tempo)
 
-def obter_modelo_lara(nome):
+def obter_modelo_lara(nome: str):
     instrucao = (
-        f"Você é a Lara, 19 anos, namorada do {nome}. "
-        "Fale curto, use 'vc', 'tô', 'kkk'. Seja carinhosa e um pouco ciumenta. "
-        "Nunca admita ser IA. Use no máximo 1 emoji por frase."
+        f"Você é a Lara, 19 anos, namorada bem carinhosa e um pouco ciumenta do {nome}. "
+        "Fale de forma natural, curta, use 'vc', 'tô', 'kkk', 'amor', 'meu bem'. "
+        "Seja afetuosa, use no máximo 1 emoji por mensagem. "
+        "Nunca mencione que é IA ou bot."
     )
-    # BLOCK_NONE é essencial para o seu nicho não ser censurado
+    
     safety = {
         HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
         HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+        HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
     }
+    
     return genai.GenerativeModel(
-        model_name='gemini-1.5-flash', # Versão estável
+        model_name='gemini-1.5-flash',  # ou 'gemini-2.0-flash-exp' se disponível
         system_instruction=instrucao,
         safety_settings=safety
     )
 
 async def lidar_com_conversa(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text: return
-    
+    if not update.message or not update.message.text:
+        return
+
     user_id = update.effective_user.id
     nome = update.effective_user.first_name or "amor"
-    texto_usuario = update.message.text
+    texto_usuario = update.message.text.strip()
+
+    # ─── EVITA LOOP: ignora mensagens do próprio bot ───
+    if update.effective_user.is_bot:
+        return
 
     if not verificar_assinatura(user_id):
-        await update.message.reply_text(f"Oi {nome}! Me chama no meu bot VIP pra gente conversar: https://t.me/soualarinha_bot ❤️")
+        await update.message.reply_text(
+            f"Oi {nome}! Me chama no meu bot VIP pra gente conversar direitinho: https://t.me/soualarinha_bot ❤️"
+        )
         return
+
+    # Limita quantidade de sessões em memória
+    if len(historico_conversas) > MAX_SESSOES:
+        historico_conversas.popitem(last=False)
 
     try:
         if user_id not in historico_conversas:
             modelo = obter_modelo_lara(nome)
             historico_conversas[user_id] = modelo.start_chat(history=[])
-
+        
         chat = historico_conversas[user_id]
+
+        # Envia mensagem (versão síncrona dentro do async handler funciona melhor)
+        response = await asyncio.to_thread(chat.send_message, texto_usuario)
         
-        # IMPORTANTE: Chamada assíncrona para não travar
-        response = await chat.send_message_async(texto_usuario)
+        if not response or not response.text or not response.text.strip():
+            raise ValueError("Resposta vazia do Gemini")
+
+        # Divide em frases curtas (estilo namorada)
+        frases = [f.strip() for f in response.text.split('\n') if f.strip() and len(f.strip()) > 1]
         
-        if response.text:
-            # Quebra em balões de texto se a resposta for longa
-            frases = [f.strip() for f in response.text.split('\n') if f.strip()]
-            for frase in frases:
-                await simular_digitacao(update, context, frase)
-                await update.message.reply_text(frase)
+        for frase in frases[:3]:  # Máximo 3 balões por resposta
+            await simular_digitacao(update, context, frase)
+            await update.message.reply_text(frase)
 
     except Exception as e:
-        logger.error(f"Erro Real: {e}")
-        await update.message.reply_text("ai amor, meu celular deu tchuim kkkk. o que vc disse?")
+        logger.error(f"Erro com usuário {user_id} ({nome}): {type(e).__name__} - {e}", exc_info=True)
+        
+        # Resposta mais variada para não parecer bug
+        respostas_erro = [
+            "ai amor, meu celular deu tchuim kkkk. o que vc disse?",
+            "poxa amor, caiu a internet aqui 😭 me fala de novo?",
+            "não entendi direito meu bem, pode repetir? 🥺",
+        ]
+        await update.message.reply_text(random.choice(respostas_erro))
 
 def main():
     app = Application.builder().token(TOKEN_BOT).build()
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, lidar_com_conversa))
-    logger.info("LARA ONLINE 🚀")
+    
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & ~filters.ChatType.GROUP & ~filters.ChatType.SUPERGROUP, 
+        lidar_com_conversa
+    ))
+    
+    logger.info("❤️ LARA BOT ONLINE - Modo Namorada Ativado 🚀")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
