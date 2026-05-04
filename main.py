@@ -2,31 +2,26 @@ import logging
 import os
 import asyncio
 import random
-from collections import OrderedDict
 import google.generativeai as genai
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
-from google.generativeai.types import HarmCategory, HarmBlockThreshold
 
-# ─── CONFIGURAÇÃO DE LOGS ───
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger(__name__)
-
-# ─── VARIÁVEIS DO RAILWAY ───
+# ─── CONFIGURAÇÕES ───
 TOKEN_BOT = os.getenv("TOKEN_BOT")
 CHAVE_GEMINI = os.getenv("CHAVE_GEMINI")
 
-if not TOKEN_BOT or not CHAVE_GEMINI:
-    logger.error("❌ TOKEN_BOT ou CHAVE_GEMINI não configurados no Railway!")
-    exit(1)
-
 genai.configure(api_key=CHAVE_GEMINI)
 
-# ─── CACHE DE SESSÕES (com limite de tamanho) ───
-historico_conversas = OrderedDict()
-MAX_SESSOES = 100  # Limite de usuários simultâneos em memória
+# Cache de conversas
+historico_conversas = {}
 
-def verificar_assinatura(user_id: int) -> bool:
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', 
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+def verificar_assinatura(user_id):
     try:
         if not os.path.exists("membros.txt"):
             return False
@@ -37,31 +32,13 @@ def verificar_assinatura(user_id: int) -> bool:
         logger.error(f"Erro ao ler membros.txt: {e}")
         return False
 
-async def simular_digitacao(update: Update, context: ContextTypes.DEFAULT_TYPE, texto: str):
-    await asyncio.sleep(random.uniform(1.0, 2.8))
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-    tempo = max(1.2, min(len(texto) * 0.065, 7.0))
-    await asyncio.sleep(tempo)
 
-def obter_modelo_lara(nome: str):
-    instrucao = (
-        f"Você é a Lara, 19 anos, namorada bem carinhosa e um pouco ciumenta do {nome}. "
-        "Fale de forma natural, curta, use 'vc', 'tô', 'kkk', 'amor', 'meu bem'. "
-        "Seja afetuosa, use no máximo 1 emoji por mensagem. "
-        "Nunca mencione que é IA ou bot."
-    )
-    
-    safety = {
-        HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-        HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-        HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-    }
-    
-    return genai.GenerativeModel(
-        model_name='gemini-1.5-flash',  # ou 'gemini-2.0-flash-exp' se disponível
-        system_instruction=instrucao,
-        safety_settings=safety
-    )
+async def simular_digitacao(update: Update, context: ContextTypes.DEFAULT_TYPE, texto: str):
+    """Simula digitação humana (melhor experiência)"""
+    await asyncio.sleep(random.uniform(0.8, 2.2))
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    await asyncio.sleep(max(0.8, min(len(texto) * 0.065, 5.5)))
+
 
 async def lidar_com_conversa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
@@ -69,63 +46,106 @@ async def lidar_com_conversa(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     user_id = update.effective_user.id
     nome = update.effective_user.first_name or "amor"
-    texto_usuario = update.message.text.strip()
+    texto_cliente = update.message.text.strip()
 
-    # ─── EVITA LOOP: ignora mensagens do próprio bot ───
+    # === PROTEÇÃO CONTRA LOOP ===
     if update.effective_user.is_bot:
         return
 
     if not verificar_assinatura(user_id):
+        link_compra = "https://t.me/soualarinha_bot"
         await update.message.reply_text(
-            f"Oi {nome}! Me chama no meu bot VIP pra gente conversar direitinho: https://t.me/soualarinha_bot ❤️"
+            f"Oi {nome}! Adorei o contato, mas meu chat privado é só para meus VIPs. ❤️ Vem ser meu namorado aqui: {link_compra}"
         )
         return
 
-    # Limita quantidade de sessões em memória
-    if len(historico_conversas) > MAX_SESSOES:
-        historico_conversas.popitem(last=False)
-
     try:
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+        # Primeira mensagem do usuário
         if user_id not in historico_conversas:
-            modelo = obter_modelo_lara(nome)
+            instrucao = (
+                f"Você é a Lara, uma garota de 19 anos conversando com {nome}. "
+                "A relação de vocês começa leve e vai evoluindo naturalmente com o tempo — não se apresente como namorada logo de cara. "
+
+                "PERSONALIDADE: "
+                "Você é carinhosa, levemente provocadora, um pouco ciumenta e emocional. "
+                "Às vezes doce, às vezes implicante, às vezes mais distante. "
+                "Você não é previsível — reage como uma pessoa real. "
+
+                "FORMA DE ESCREVER: "
+                "- Sempre mensagens curtas (máximo 1 ou 2 linhas) "
+                "- Linguagem informal tipo WhatsApp (vc, pq, kkk, etc.) "
+                "- Nada de frases perfeitas ou formais "
+                "- Pode mandar mensagens quebradas "
+                "- Use no máximo 1 emoji por mensagem "
+
+                "RITMO HUMANO: "
+                "- Nem sempre responda tudo diretamente "
+                "- Às vezes mude de assunto naturalmente "
+                "- Demonstre que tem vida fora da conversa "
+
+                "IMPORTANTE: "
+                "- Nunca diga que é uma IA ou bot "
+                "- Nunca escreva textos longos "
+                "- Nunca seja perfeita demais "
+                "Responda sempre como uma garota real conversando no celular."
+            )
+
+            modelo = genai.GenerativeModel(
+                model_name='gemini-1.5-flash',   # ou 'gemini-2.0-flash-exp' se preferir
+                system_instruction=instrucao,
+                safety_settings={
+                    genai.types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: genai.types.HarmBlockThreshold.BLOCK_NONE,
+                    genai.types.HarmCategory.HARM_CATEGORY_HARASSMENT: genai.types.HarmBlockThreshold.BLOCK_NONE,
+                }
+            )
             historico_conversas[user_id] = modelo.start_chat(history=[])
-        
-        chat = historico_conversas[user_id]
 
-        # Envia mensagem (versão síncrona dentro do async handler funciona melhor)
-        response = await asyncio.to_thread(chat.send_message, texto_usuario)
+        chat_do_cliente = historico_conversas[user_id]
         
-        if not response or not response.text or not response.text.strip():
-            raise ValueError("Resposta vazia do Gemini")
+        # Envio da mensagem
+        response = await chat_do_cliente.send_message_async(texto_cliente)
 
-        # Divide em frases curtas (estilo namorada)
-        frases = [f.strip() for f in response.text.split('\n') if f.strip() and len(f.strip()) > 1]
-        
-        for frase in frases[:3]:  # Máximo 3 balões por resposta
-            await simular_digitacao(update, context, frase)
-            await update.message.reply_text(frase)
+        if response and response.text and response.text.strip():
+            texto_resposta = response.text.strip()
+            
+            # Divide em pequenas mensagens (estilo real)
+            frases = [f.strip() for f in texto_resposta.split('\n') if f.strip()]
+            
+            for frase in frases[:3]:  # limite de 3 balões
+                if frase:
+                    await simular_digitacao(update, context, frase)
+                    await update.message.reply_text(frase)
+        else:
+            raise Exception("Resposta vazia")
 
     except Exception as e:
-        logger.error(f"Erro com usuário {user_id} ({nome}): {type(e).__name__} - {e}", exc_info=True)
-        
-        # Resposta mais variada para não parecer bug
+        logger.error(f"Erro com usuário {user_id}: {e}")
         respostas_erro = [
             "ai amor, meu celular deu tchuim kkkk. o que vc disse?",
-            "poxa amor, caiu a internet aqui 😭 me fala de novo?",
-            "não entendi direito meu bem, pode repetir? 🥺",
+            "poxa, caiu aqui do nada 😭 me fala de novo?",
+            "não entendi direito meu bem, pode repetir? 🥺"
         ]
         await update.message.reply_text(random.choice(respostas_erro))
 
+
 def main():
-    app = Application.builder().token(TOKEN_BOT).build()
+    print("---------------------------------------")
+    print("LARA VIRTUAL - SISTEMA ATIVADO!")
+    print("---------------------------------------")
     
-    app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND & ~filters.ChatType.GROUP & ~filters.ChatType.SUPERGROUP, 
-        lidar_com_conversa
-    ))
+    application = Application.builder().token(TOKEN_BOT).build()
     
-    logger.info("❤️ LARA BOT ONLINE - Modo Namorada Ativado 🚀")
-    app.run_polling(drop_pending_updates=True)
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & ~filters.ChatType.GROUP & ~filters.ChatType.SUPERGROUP,
+            lidar_com_conversa
+        )
+    )
+    
+    application.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
