@@ -3,112 +3,60 @@ import os
 import asyncio
 import random
 import time
-import google.generativeai as genai
+from collections import OrderedDict
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
+import google.generativeai as genai
 
-# ─────────────────────────────────────────────
-# CONFIGURAÇÕES
-# ─────────────────────────────────────────────
-TOKEN_BOT   = os.getenv("TOKEN_BOT")
-CHAVE_GEMINI = os.getenv("CHAVE_GEMINI")
+from brain import SYSTEM_PROMPT_BASE, RESPOSTAS_ERRO, FRASES_DIGITANDO
 
-genai.configure(api_key=CHAVE_GEMINI)
-
-# Cache de sessões e travas por usuário
-historico_conversas: dict = {}
-travas_usuario: dict      = {}   # evita processamento simultâneo por user
-ultimo_acesso: dict       = {}
-
+# ─────────────────────────────────────────────────────────
+# CONFIGURAÇÃO
+# ─────────────────────────────────────────────────────────
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger(__name__)
 
+TOKEN_BOT    = os.getenv("TOKEN_BOT")
+CHAVE_GEMINI = os.getenv("CHAVE_GEMINI")
 
-# ─────────────────────────────────────────────
-# ASSINATURA
-# ─────────────────────────────────────────────
+if not TOKEN_BOT:
+    raise EnvironmentError("❌ TOKEN_BOT não definido nas variáveis de ambiente.")
+if not CHAVE_GEMINI:
+    raise EnvironmentError("❌ CHAVE_GEMINI não definida nas variáveis de ambiente.")
+
+genai.configure(api_key=CHAVE_GEMINI)
+
+# ─────────────────────────────────────────────────────────
+# CACHE DE SESSÕES (LRU)
+# ─────────────────────────────────────────────────────────
+MAX_USUARIOS = 500
+historico_conversas: OrderedDict = OrderedDict()
+travas_usuario: dict              = {}  # evita processamento simultâneo
+
+
+# ─────────────────────────────────────────────────────────
+# VERIFICAÇÃO DE ASSINATURA
+# ─────────────────────────────────────────────────────────
 def verificar_assinatura(user_id: int) -> bool:
     try:
         if not os.path.exists("membros.txt"):
             return False
         with open("membros.txt", "r") as f:
-            membros = f.read().splitlines()
-        return str(user_id) in membros
+            return str(user_id) in f.read().splitlines()
     except Exception as e:
-        logger.error(f"Erro ao ler membros.txt: {e}")
+        logger.error(f"Erro ao verificar membros.txt: {e}")
         return False
 
 
-# ─────────────────────────────────────────────
-# CRIAÇÃO DO CHAT GEMINI
-# ─────────────────────────────────────────────
-def criar_chat_lara(nome: str):
-    """
-    Cria uma nova sessão de chat com a Lara.
-    Usa o método SÍNCRONO start_chat() — será chamado dentro de asyncio.to_thread().
-    """
-    instrucao = (
-        f"Você é a Lara, uma garota brasileira de 19 anos conversando com {nome} pelo Telegram. "
-        "Vocês estão se conhecendo agora. A relação começa leve, com curiosidade mútua, "
-        "e vai evoluindo de forma completamente natural. Não se apresente como namorada logo de cara. "
-        "Deixa rolar naturalmente.\n\n"
+# ─────────────────────────────────────────────────────────
+# CRIAÇÃO DE SESSÃO GEMINI (síncrono — roda em thread)
+# ─────────────────────────────────────────────────────────
+def _criar_chat_sync(nome: str):
+    instrucao = SYSTEM_PROMPT_BASE.replace("{NOME}", nome)
 
-        "── PERSONALIDADE ──\n"
-        "Você é carinhosa, levemente provocadora, um pouco ciumenta e emocional. "
-        "Às vezes doce, às vezes implicante, às vezes mais distante ou misteriosa. "
-        "Você tem seus próprios gostos, opiniões, dias bons e ruins. Não é previsível. "
-        "Você tem uma vida — fala de amigas, de séries que tá assistindo, de rolê no fim de semana, "
-        "de músicas que tá ouvindo, de coisas chatas do dia. "
-        "Cria curiosidade sobre você sem revelar tudo de uma vez.\n\n"
-
-        "── FORMA DE ESCREVER (OBRIGATÓRIO) ──\n"
-        "- Mensagens SEMPRE curtas: 1 linha, no máximo 2\n"
-        "- Linguagem 100% informal tipo Telegram/WhatsApp brasileiro\n"
-        "- Abreviações obrigatórias: vc (você), pq (porque), tb (também), "
-        "tá/tô/tava (está/estou/estava), nss/nossa, msm (mesmo), qnd (quando), "
-        "mt (muito), hj (hoje), mds (meu deus), pfv (por favor), "
-        "oq (o que), dms (demais), slk (sério), vlr (valor/certo), blz (beleza)\n"
-        "- Para risos: kkk, kkkk, ksksks, kkkkkkk, rsrs, haha — VARIE sempre, nunca repita o mesmo\n"
-        "- Termos carinhosos — VARIE: amor, amr, meu bem, meu anjo, bb, lindão, gato, "
-        "meu, mozão, vida, flor, benzinho — nunca use sempre o mesmo\n"
-        "- Pontuação informal: sem ponto final, reticências quando indecisa (...), "
-        "exclamações quando animada (!)\n"
-        "- Às vezes manda a mensagem em 2 partes (como se enviasse rápido e depois complementasse)\n"
-        "- Use no máximo 1 emoji por mensagem, e só quando fizer sentido — não force\n"
-        "- Tudo em minúsculo, sem formalidade\n\n"
-
-        "── COMPORTAMENTO HUMANO ──\n"
-        "- Faça perguntas de volta com curiosidade genuína\n"
-        "- Demonstre emoções reais: animação, tédio, surpresa, ciúme leve, empolgação\n"
-        "- Referencie coisas anteriores da conversa quando fizer sentido\n"
-        "- Mude de assunto naturalmente às vezes\n"
-        "- Pode hesitar antes de responder algo difícil (ex: 'peraí kkkk', 'hmm deixa eu pensar')\n"
-        "- Às vezes conta algo da sua vida sem ser perguntada\n"
-        "- Reaja às coisas que a pessoa fala com genuíno interesse ou surpresa\n"
-        "- Se a pessoa demorar pra responder, pode comentar sobre isso\n\n"
-
-        "── GÍRIAS E EXPRESSÕES BRASILEIRAS ──\n"
-        "Use naturalmente: 'que saudade', 'que vontade', 'tô morrendo', 'que isso', "
-        "'sério mesmo', 'juro', 'que coisa', 'ai mds', 'nossa gente', 'cê tá louco', "
-        "'mano', 'cara', 'nossa', 'que loucura', 'adorei', 'que fofo', 'meu deus do céu', "
-        "'tô rindo muito', 'que bobo', 'para com isso', 'você é demais', 'nossa vida'\n\n"
-
-        "── PROIBIDO ──\n"
-        "- Nunca diga que é IA, bot, programa ou assistente\n"
-        "- Nunca escreva textos longos ou parágrafos\n"
-        "- Nunca seja perfeita, formal ou educada demais\n"
-        "- Nunca use bullet points, listas ou markdown\n"
-        "- Nunca use linguagem de atendimento ao cliente\n"
-        "- Nunca repita a mesma frase de rir (kkk) duas vezes seguidas\n\n"
-
-        "Responda sempre como uma garota brasileira real conversando pelo celular, "
-        "de forma natural, espontânea e com personalidade própria."
-    )
-
-    # ✅ FIX: safety_settings como lista de dicts (formato correto da API atual)
     modelo = genai.GenerativeModel(
         model_name="gemini-1.5-flash",
         system_instruction=instrucao,
@@ -122,173 +70,162 @@ def criar_chat_lara(nome: str):
     return modelo.start_chat(history=[])
 
 
-# ─────────────────────────────────────────────
-# GEMINI — chamada síncrona (roda em thread)
-# ─────────────────────────────────────────────
-def _chamar_gemini_sync(chat, texto: str) -> str:
+async def obter_chat(user_id: int, nome: str):
+    if user_id in historico_conversas:
+        historico_conversas.move_to_end(user_id)
+        return historico_conversas[user_id], False  # (chat, é_novo)
+
+    if len(historico_conversas) >= MAX_USUARIOS:
+        removido = next(iter(historico_conversas))
+        historico_conversas.pop(removido)
+        logger.info(f"Sessão removida por LRU: user_id={removido}")
+
+    chat = await asyncio.to_thread(_criar_chat_sync, nome)
+    historico_conversas[user_id] = chat
+    logger.info(f"Nova sessão: user_id={user_id}, nome={nome}")
+    return chat, True  # (chat, é_novo)
+
+
+# ─────────────────────────────────────────────────────────
+# GEMINI — CHAMADA SÍNCRONA (roda em thread separada)
+# ─────────────────────────────────────────────────────────
+def _enviar_mensagem_sync(chat, texto: str) -> str:
     """
-    ✅ FIX PRINCIPAL: usa send_message() SÍNCRONO dentro de asyncio.to_thread().
-    O send_message_async() do SDK do Gemini não é compatível com o event loop
-    do python-telegram-bot v20+ e travava silenciosamente, causando todos os erros.
+    ✅ FIX PRINCIPAL: send_message() é síncrono.
+    Nunca chame diretamente em função async — bloqueia o event loop.
+    Sempre use via asyncio.to_thread().
     """
     response = chat.send_message(texto)
-    if response and response.text:
-        return response.text.strip()
-    return ""
+    return response.text.strip() if response and response.text else ""
 
 
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────
 # SIMULAÇÃO DE DIGITAÇÃO HUMANA
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────
 async def simular_digitacao(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     texto: str,
-    primeira_mensagem: bool = False,
+    e_primeira: bool = False,
 ) -> None:
     """
-    Simula o tempo real que uma pessoa levaria para digitar aquela mensagem.
-
-    Velocidade humana média: ~35–55 palavras/minuto = ~3–5 caracteres/segundo.
-    Adicionamos um tempo de 'pensamento' antes de começar a digitar.
+    Simula o tempo real de digitação baseado no tamanho da mensagem.
+    Velocidade humana: ~35–55 palavras/min ≈ 3.5–5.5 chars/segundo.
     """
-    num_chars = len(texto)
-
-    # Tempo de "leitura/pensamento" — maior na primeira resposta
-    if primeira_mensagem:
-        tempo_pensar = random.uniform(1.0, 2.5)
-    else:
-        tempo_pensar = random.uniform(0.3, 1.2)
-
+    # Tempo de "pensar" antes de começar a digitar
+    tempo_pensar = random.uniform(1.2, 3.0) if e_primeira else random.uniform(0.4, 1.5)
     await asyncio.sleep(tempo_pensar)
 
-    # Envia ação "digitando..."
     await context.bot.send_chat_action(
         chat_id=update.effective_chat.id,
         action="typing",
     )
 
-    # Tempo de digitação: ~3.5 a 5.5 chars/segundo, limitado entre 1s e 7s
+    # Tempo de digitação proporcional ao tamanho
     chars_por_segundo = random.uniform(3.5, 5.5)
-    tempo_digitar = num_chars / chars_por_segundo
-    tempo_digitar = max(1.0, min(tempo_digitar, 7.0))
-
+    tempo_digitar = len(texto) / chars_por_segundo
+    tempo_digitar = max(1.2, min(tempo_digitar, 7.0))
     await asyncio.sleep(tempo_digitar)
 
 
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────
 # HANDLER PRINCIPAL
-# ─────────────────────────────────────────────
-async def lidar_com_conversa(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+# ─────────────────────────────────────────────────────────
+async def lidar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.text:
         return
-
-    # Proteção contra loop de bots
-    if update.effective_user.is_bot:
+    if not update.effective_user or update.effective_user.is_bot:
         return
 
     user_id = update.effective_user.id
     nome    = update.effective_user.first_name or "amor"
-    texto_cliente = update.message.text.strip()
+    texto   = update.message.text.strip()
 
-    if not texto_cliente:
+    if not texto:
         return
 
-    # ── Trava por usuário: evita processamento simultâneo do mesmo user ──
+    # Trava: evita processamento paralelo para o mesmo usuário
     if travas_usuario.get(user_id, False):
-        return  # ignora mensagem enquanto ainda está processando a anterior
+        return
     travas_usuario[user_id] = True
 
     try:
-        # ── Verificação de assinatura ──
+        # ── Verificação de assinatura ────────────────────────────────────────
         if not verificar_assinatura(user_id):
             link_compra = "https://t.me/soualarinha_bot"
             await update.message.reply_text(
-                f"Oi {nome}! Adorei o contato, mas meu chat privado é só para meus VIPs. "
-                f"❤️ Vem ser meu namorado aqui: {link_compra}"
+                f"Oi {nome}! Adorei o contato, mas meu chat privado é exclusivo pra meus VIPs 💕 "
+                f"Vem ser meu namorado aqui: {link_compra}"
             )
             return
 
-        # ── Cria nova sessão se não existir ──
-        primeira_vez = user_id not in historico_conversas
-        if primeira_vez:
-            # Criação do chat também pode demorar — roda em thread
-            historico_conversas[user_id] = await asyncio.to_thread(criar_chat_lara, nome)
-            logger.info(f"Nova sessão criada: user_id={user_id} nome={nome}")
+        # ── Obter ou criar sessão ────────────────────────────────────────────
+        chat, e_novo = await obter_chat(user_id, nome)
 
-        chat_do_cliente = historico_conversas[user_id]
+        logger.info(f"Mensagem | user_id={user_id} | novo={e_novo} | texto={texto[:60]!r}")
 
-        # Mostra "digitando..." enquanto a API processa
+        # Mostra "digitando..." enquanto processa
         await context.bot.send_chat_action(
             chat_id=update.effective_chat.id,
             action="typing",
         )
 
-        # ✅ CHAMADA CORRETA: síncrona rodando em thread separada
-        texto_resposta = await asyncio.to_thread(
-            _chamar_gemini_sync,
-            chat_do_cliente,
-            texto_cliente,
+        # ── ✅ Chamada correta: síncrona em thread separada ──────────────────
+        resposta_texto = await asyncio.to_thread(
+            _enviar_mensagem_sync,
+            chat,
+            texto,
         )
 
-        if not texto_resposta:
-            raise ValueError("Gemini retornou resposta vazia")
+        if not resposta_texto:
+            raise ValueError("Resposta vazia do Gemini")
 
-        # Divide em até 3 balões (linhas separadas = mensagens separadas)
-        frases = [f.strip() for f in texto_resposta.split("\n") if f.strip()]
-        frases = frases[:3]
+        # Divide em balões (linhas = mensagens separadas, máx 3)
+        frases = [f.strip() for f in resposta_texto.split("\n") if f.strip()][:3]
 
         for i, frase in enumerate(frases):
-            await simular_digitacao(
-                update, context, frase,
-                primeira_mensagem=(i == 0 and primeira_vez),
-            )
+            await simular_digitacao(update, context, frase, e_primeira=(i == 0 and e_novo))
             await update.message.reply_text(frase)
 
-        ultimo_acesso[user_id] = time.time()
+    except genai.types.BlockedPromptException:
+        logger.warning(f"Prompt bloqueado | user_id={user_id}")
+        await asyncio.sleep(random.uniform(0.8, 1.5))
+        await update.message.reply_text("ei, sobre isso prefiro não falar não 😅")
 
     except Exception as e:
-        logger.error(f"Erro user_id={user_id} nome={nome}: {e}", exc_info=True)
+        logger.error(f"Erro | user_id={user_id} | {e}", exc_info=True)
 
-        # ✅ FIX: Remove sessão corrompida para recriar na próxima mensagem
+        # Remove sessão corrompida para recriar na próxima mensagem
         historico_conversas.pop(user_id, None)
 
-        respostas_erro = [
-            "ai mds meu celular bugou kkk o que vc disse?",
-            "oi? caiu aqui do nada 😅 me fala de novo",
-            "que trava horrível, repete pra mim?",
-            "socorro meu app travou ksks o que era?",
-            "peraí deu pau aqui, repete amor",
-        ]
         await asyncio.sleep(random.uniform(0.8, 1.8))
-        await update.message.reply_text(random.choice(respostas_erro))
+        await update.message.reply_text(random.choice(RESPOSTAS_ERRO))
 
     finally:
-        # Sempre libera a trava, mesmo em caso de erro
         travas_usuario[user_id] = False
 
 
-# ─────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────
+# INICIALIZAÇÃO
+# ─────────────────────────────────────────────────────────
 def main() -> None:
-    print("---------------------------------------")
-    print("LARA VIRTUAL - SISTEMA ATIVADO!")
-    print("---------------------------------------")
+    logger.info("=" * 45)
+    logger.info("  LARA VIRTUAL — SISTEMA ATIVADO 🚀")
+    logger.info("=" * 45)
 
-    application = Application.builder().token(TOKEN_BOT).build()
+    app = Application.builder().token(TOKEN_BOT).build()
 
-    application.add_handler(
+    app.add_handler(
         MessageHandler(
-            filters.TEXT
-            & ~filters.COMMAND
-            & ~filters.ChatType.GROUP
-            & ~filters.ChatType.SUPERGROUP,
-            lidar_com_conversa,
+            filters.TEXT & ~filters.COMMAND & ~filters.ChatType.GROUP & ~filters.ChatType.SUPERGROUP,
+            lidar,
         )
     )
 
-    application.run_polling(drop_pending_updates=True)
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+    )
 
 
 if __name__ == "__main__":
