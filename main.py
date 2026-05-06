@@ -27,10 +27,10 @@ if not TOKEN_BOT:
 if not CHAVE_GEMINI:
     raise EnvironmentError("❌ CHAVE_GEMINI não definida nas variáveis de ambiente.")
 
-# ✅ FIX: sufixo -latest necessário — "gemini-1.5-flash" puro retorna 404
+# ✅ gemini-2.0-flash-lite: modelo mais leve, cota gratuita separada dos outros
 GEMINI_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
-    f"gemini-1.5-flash-latest:generateContent?key={CHAVE_GEMINI}"
+    f"gemini-2.0-flash-lite:generateContent?key={CHAVE_GEMINI}"
 )
 
 # ─────────────────────────────────────────────────────────
@@ -104,7 +104,7 @@ def obter_sessao(user_id: int, nome: str) -> tuple:
 
 
 # ─────────────────────────────────────────────────────────
-# CHAMADA DIRETA À API REST DO GEMINI (100% async, sem SDK)
+# CHAMADA DIRETA À API REST DO GEMINI
 # ─────────────────────────────────────────────────────────
 async def chamar_gemini(sessao: dict, texto_usuario: str) -> str:
     sessao["history"].append({
@@ -135,6 +135,14 @@ async def chamar_gemini(sessao: dict, texto_usuario: str) -> str:
     for tentativa in range(3):
         async with httpx.AsyncClient(timeout=25.0) as client:
             resp = await client.post(GEMINI_URL, json=payload)
+
+        # ✅ Log detalhado para diagnosticar qualquer erro da API
+        if not resp.is_success:
+            logger.error(
+                f"❌ Gemini respondeu {resp.status_code} | "
+                f"modelo={GEMINI_URL.split('/models/')[1].split(':')[0]} | "
+                f"body={resp.text[:500]}"
+            )
 
         if resp.status_code == 429:
             espera = (2 ** tentativa) * 10  # 10s → 20s → 40s
@@ -244,8 +252,8 @@ async def lidar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     except httpx.HTTPStatusError as e:
         logger.error(
-            f"Erro HTTP Gemini | status={e.response.status_code} | body={e.response.text}",
-            exc_info=True,
+            f"Erro HTTP Gemini | status={e.response.status_code} | body={e.response.text[:300]}",
+            exc_info=False,
         )
         historico_conversas.pop(user_id, None)
         await asyncio.sleep(random.uniform(0.8, 1.5))
@@ -269,15 +277,12 @@ async def lidar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ─────────────────────────────────────────────────────────
-# HANDLER DE ERRO GLOBAL — captura Conflict (409) do Railway
+# HANDLER DE ERRO GLOBAL
 # ─────────────────────────────────────────────────────────
 async def handler_erro_global(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     erro = context.error
     if isinstance(erro, Conflict):
-        # ✅ FIX: Railway sobe novo container antes de matar o antigo (rolling deploy).
-        # Aguardamos 20s para o container antigo morrer e então encerramos.
-        # O Railway reinicia o processo automaticamente, já sem conflito.
-        logger.warning("⚠️ Conflict 409 — Railway rolling deploy detectado. Aguardando 20s para restart limpo...")
+        logger.warning("⚠️ Conflict 409 — Railway rolling deploy. Aguardando 20s para restart...")
         await asyncio.sleep(20)
         logger.info("🔄 Encerrando para restart limpo...")
         sys.exit(0)
@@ -286,27 +291,39 @@ async def handler_erro_global(update: object, context: ContextTypes.DEFAULT_TYPE
 
 
 # ─────────────────────────────────────────────────────────
-# STARTUP: deleta webhook + aguarda deploy antigo encerrar
+# STARTUP
 # ─────────────────────────────────────────────────────────
 async def on_startup(app: Application) -> None:
-    # Deleta webhook ativo para liberar polling
     await app.bot.delete_webhook(drop_pending_updates=True)
     logger.info("✅ Webhook deletado — polling liberado")
 
-    # ✅ FIX: Delay de startup para o Railway encerrar o container antigo
-    # antes do novo começar a fazer polling (evita 409 no início)
     startup_delay = int(os.getenv("STARTUP_DELAY", "12"))
     if startup_delay > 0:
         logger.info(f"⏳ Aguardando {startup_delay}s (Railway rolling deploy)...")
         await asyncio.sleep(startup_delay)
-        logger.info("✅ Pronto para receber mensagens")
+
+    # ✅ Testa a chave do Gemini no startup para detectar problemas cedo
+    logger.info(f"🔍 Testando chave Gemini com modelo: {GEMINI_URL.split('/models/')[1].split(':')[0]}")
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(GEMINI_URL, json={
+                "contents": [{"role": "user", "parts": [{"text": "oi"}]}],
+                "generationConfig": {"maxOutputTokens": 10},
+            })
+        if resp.is_success:
+            logger.info("✅ Gemini OK — API respondendo normalmente")
+        else:
+            logger.error(f"❌ Gemini FALHOU no teste de startup | status={resp.status_code} | body={resp.text[:300]}")
+    except Exception as e:
+        logger.error(f"❌ Gemini FALHOU no teste de startup | {e}")
+
+    logger.info("✅ Pronto para receber mensagens")
 
 
 # ─────────────────────────────────────────────────────────
 # INICIALIZAÇÃO
 # ─────────────────────────────────────────────────────────
 def main() -> None:
-    # Lock de arquivo: impede duas instâncias no mesmo host
     lock_file = open("/tmp/lara_bot.lock", "w")
     try:
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -335,7 +352,6 @@ def main() -> None:
         )
     )
 
-    # ✅ FIX: captura Conflict globalmente e faz restart limpo
     app.add_error_handler(handler_erro_global)
 
     app.run_polling(
