@@ -19,19 +19,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TOKEN_BOT    = os.getenv("TOKEN_BOT")
-CHAVE_GEMINI = os.getenv("CHAVE_GEMINI")
+TOKEN_BOT  = os.getenv("TOKEN_BOT")
+CHAVE_GROQ = os.getenv("CHAVE_GROQ")
 
 if not TOKEN_BOT:
     raise EnvironmentError("❌ TOKEN_BOT não definido nas variáveis de ambiente.")
-if not CHAVE_GEMINI:
-    raise EnvironmentError("❌ CHAVE_GEMINI não definida nas variáveis de ambiente.")
+if not CHAVE_GROQ:
+    raise EnvironmentError("❌ CHAVE_GROQ não definida nas variáveis de ambiente.")
 
-# ✅ gemini-2.0-flash-lite: modelo mais leve, cota gratuita separada dos outros
-GEMINI_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/models/"
-    f"gemini-2.0-flash-lite:generateContent?key={CHAVE_GEMINI}"
-)
+# ✅ Groq — gratuito, rápido, sem quota zerada
+GROQ_URL   = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL = "llama3-70b-8192"
 
 # ─────────────────────────────────────────────────────────
 # PERSONALIDADE DA LARA
@@ -104,64 +102,51 @@ def obter_sessao(user_id: int, nome: str) -> tuple:
 
 
 # ─────────────────────────────────────────────────────────
-# CHAMADA DIRETA À API REST DO GEMINI
+# CHAMADA À API DO GROQ (formato OpenAI-compatível)
 # ─────────────────────────────────────────────────────────
-async def chamar_gemini(sessao: dict, texto_usuario: str) -> str:
-    sessao["history"].append({
-        "role": "user",
-        "parts": [{"text": texto_usuario}],
-    })
+async def chamar_groq(sessao: dict, texto_usuario: str) -> str:
+    sessao["history"].append({"role": "user", "content": texto_usuario})
 
+    # Mantém no máximo 40 turnos
     if len(sessao["history"]) > 40:
         sessao["history"] = sessao["history"][-40:]
 
+    messages = [{"role": "system", "content": sessao["system"]}] + sessao["history"]
+
     payload = {
-        "system_instruction": {
-            "parts": [{"text": sessao["system"]}]
-        },
-        "contents": sessao["history"],
-        "safetySettings": [
-            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",  "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_HARASSMENT",          "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_HATE_SPEECH",         "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT",   "threshold": "BLOCK_NONE"},
-        ],
-        "generationConfig": {
-            "temperature": 0.95,
-            "maxOutputTokens": 300,
-        },
+        "model": GROQ_MODEL,
+        "messages": messages,
+        "temperature": 0.95,
+        "max_tokens": 300,
+    }
+
+    headers = {
+        "Authorization": f"Bearer {CHAVE_GROQ}",
+        "Content-Type": "application/json",
     }
 
     for tentativa in range(3):
         async with httpx.AsyncClient(timeout=25.0) as client:
-            resp = await client.post(GEMINI_URL, json=payload)
+            resp = await client.post(GROQ_URL, json=payload, headers=headers)
 
-        # ✅ Log detalhado para diagnosticar qualquer erro da API
         if not resp.is_success:
-            logger.error(
-                f"❌ Gemini respondeu {resp.status_code} | "
-                f"modelo={GEMINI_URL.split('/models/')[1].split(':')[0]} | "
-                f"body={resp.text[:500]}"
-            )
+            logger.error(f"❌ Groq respondeu {resp.status_code} | body={resp.text[:300]}")
 
         if resp.status_code == 429:
-            espera = (2 ** tentativa) * 10  # 10s → 20s → 40s
-            logger.warning(f"Rate limit 429 — aguardando {espera}s (tentativa {tentativa + 1}/3)")
+            espera = (2 ** tentativa) * 5  # 5s → 10s → 20s
+            logger.warning(f"Rate limit 429 Groq — aguardando {espera}s (tentativa {tentativa + 1}/3)")
             await asyncio.sleep(espera)
             continue
 
         resp.raise_for_status()
         break
     else:
-        raise Exception("Gemini indisponível após 3 tentativas (429)")
+        raise Exception("Groq indisponível após 3 tentativas (429)")
 
     data = resp.json()
-    texto_resposta = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    texto_resposta = data["choices"][0]["message"]["content"].strip()
 
-    sessao["history"].append({
-        "role": "model",
-        "parts": [{"text": texto_resposta}],
-    })
+    sessao["history"].append({"role": "assistant", "content": texto_resposta})
 
     return texto_resposta
 
@@ -239,7 +224,7 @@ async def lidar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             action="typing",
         )
 
-        resposta_texto = await chamar_gemini(sessao, texto)
+        resposta_texto = await chamar_groq(sessao, texto)
 
         if not resposta_texto:
             raise ValueError("Resposta vazia")
@@ -251,10 +236,7 @@ async def lidar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text(frase)
 
     except httpx.HTTPStatusError as e:
-        logger.error(
-            f"Erro HTTP Gemini | status={e.response.status_code} | body={e.response.text[:300]}",
-            exc_info=False,
-        )
+        logger.error(f"Erro HTTP Groq | status={e.response.status_code} | body={e.response.text[:300]}")
         historico_conversas.pop(user_id, None)
         await asyncio.sleep(random.uniform(0.8, 1.5))
         await update.message.reply_text("tive um probleminha aqui, tenta de novo amor?")
@@ -302,20 +284,21 @@ async def on_startup(app: Application) -> None:
         logger.info(f"⏳ Aguardando {startup_delay}s (Railway rolling deploy)...")
         await asyncio.sleep(startup_delay)
 
-    # ✅ Testa a chave do Gemini no startup para detectar problemas cedo
-    logger.info(f"🔍 Testando chave Gemini com modelo: {GEMINI_URL.split('/models/')[1].split(':')[0]}")
+    # Testa chave do Groq no startup
+    logger.info(f"🔍 Testando chave Groq com modelo: {GROQ_MODEL}")
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(GEMINI_URL, json={
-                "contents": [{"role": "user", "parts": [{"text": "oi"}]}],
-                "generationConfig": {"maxOutputTokens": 10},
-            })
+            resp = await client.post(
+                GROQ_URL,
+                json={"model": GROQ_MODEL, "messages": [{"role": "user", "content": "oi"}], "max_tokens": 5},
+                headers={"Authorization": f"Bearer {CHAVE_GROQ}", "Content-Type": "application/json"},
+            )
         if resp.is_success:
-            logger.info("✅ Gemini OK — API respondendo normalmente")
+            logger.info("✅ Groq OK — API respondendo normalmente")
         else:
-            logger.error(f"❌ Gemini FALHOU no teste de startup | status={resp.status_code} | body={resp.text[:300]}")
+            logger.error(f"❌ Groq FALHOU no teste de startup | status={resp.status_code} | body={resp.text[:300]}")
     except Exception as e:
-        logger.error(f"❌ Gemini FALHOU no teste de startup | {e}")
+        logger.error(f"❌ Groq FALHOU no teste de startup | {e}")
 
     logger.info("✅ Pronto para receber mensagens")
 
