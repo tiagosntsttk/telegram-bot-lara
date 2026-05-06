@@ -1,8 +1,10 @@
 import logging
 import os
+import sys
 import asyncio
 import random
 import httpx
+import fcntl
 from collections import OrderedDict
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
@@ -24,10 +26,10 @@ if not TOKEN_BOT:
 if not CHAVE_GEMINI:
     raise EnvironmentError("❌ CHAVE_GEMINI não definida nas variáveis de ambiente.")
 
-# URL direta da API REST do Gemini — sem SDK, zero conflito com asyncio
+# ✅ FIX: Trocado gemini-2.0-flash → gemini-1.5-flash (cota gratuita maior)
 GEMINI_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
-    f"gemini-2.0-flash:generateContent?key={CHAVE_GEMINI}"
+    f"gemini-1.5-flash:generateContent?key={CHAVE_GEMINI}"
 )
 
 # ─────────────────────────────────────────────────────────
@@ -107,7 +109,7 @@ def obter_sessao(user_id: int, nome: str) -> tuple:
 async def chamar_gemini(sessao: dict, texto_usuario: str) -> str:
     """
     Chama a API REST do Gemini diretamente com httpx async.
-    Solução definitiva: sem SDK, sem conflito com event loop.
+    ✅ FIX: Retry automático com backoff exponencial em caso de 429.
     """
     sessao["history"].append({
         "role": "user",
@@ -135,11 +137,23 @@ async def chamar_gemini(sessao: dict, texto_usuario: str) -> str:
         },
     }
 
-    async with httpx.AsyncClient(timeout=25.0) as client:
-        resp = await client.post(GEMINI_URL, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
+    # ✅ FIX: Retry com backoff exponencial para erro 429 (rate limit)
+    for tentativa in range(3):
+        async with httpx.AsyncClient(timeout=25.0) as client:
+            resp = await client.post(GEMINI_URL, json=payload)
 
+        if resp.status_code == 429:
+            espera = (2 ** tentativa) * 10  # 10s → 20s → 40s
+            logger.warning(f"Rate limit 429 — aguardando {espera}s antes de tentar novamente (tentativa {tentativa + 1}/3)")
+            await asyncio.sleep(espera)
+            continue
+
+        resp.raise_for_status()
+        break
+    else:
+        raise Exception("Gemini indisponível após 3 tentativas por rate limit (429)")
+
+    data = resp.json()
     texto_resposta = data["candidates"][0]["content"]["parts"][0]["text"].strip()
 
     sessao["history"].append({
@@ -226,7 +240,6 @@ async def lidar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             action="typing",
         )
 
-        # ✅ 100% async — sem SDK, sem bloqueio de event loop
         resposta_texto = await chamar_gemini(sessao, texto)
 
         if not resposta_texto:
@@ -267,12 +280,28 @@ async def lidar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ─────────────────────────────────────────────────────────
 # INICIALIZAÇÃO
 # ─────────────────────────────────────────────────────────
+
+# ✅ FIX: Deleta webhook antes de iniciar o polling (evita erro 409 Conflict)
+async def on_startup(app: Application) -> None:
+    await app.bot.delete_webhook(drop_pending_updates=True)
+    logger.info("✅ Webhook deletado — polling liberado sem conflito")
+
+
 def main() -> None:
+    # ✅ FIX: Lock de arquivo para garantir instância única (evita 409 em caso
+    # de restart duplo ou deploy sobreposto no Railway)
+    lock_file = open("/tmp/lara_bot.lock", "w")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except IOError:
+        logger.error("❌ Outra instância já está rodando. Encerrando para evitar conflito 409.")
+        sys.exit(1)
+
     logger.info("=" * 45)
     logger.info("  LARA VIRTUAL — SISTEMA ATIVADO 🚀")
     logger.info("=" * 45)
 
-    app = Application.builder().token(TOKEN_BOT).build()
+    app = Application.builder().token(TOKEN_BOT).post_init(on_startup).build()
     app.add_handler(
         MessageHandler(
             filters.TEXT
