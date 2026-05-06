@@ -7,6 +7,7 @@ import httpx
 import fcntl
 from collections import OrderedDict
 from telegram import Update
+from telegram.error import Conflict
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 
 # ─────────────────────────────────────────────────────────
@@ -26,10 +27,10 @@ if not TOKEN_BOT:
 if not CHAVE_GEMINI:
     raise EnvironmentError("❌ CHAVE_GEMINI não definida nas variáveis de ambiente.")
 
-# ✅ FIX: Trocado gemini-2.0-flash → gemini-1.5-flash (cota gratuita maior)
+# ✅ FIX: sufixo -latest necessário — "gemini-1.5-flash" puro retorna 404
 GEMINI_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
-    f"gemini-1.5-flash:generateContent?key={CHAVE_GEMINI}"
+    f"gemini-1.5-flash-latest:generateContent?key={CHAVE_GEMINI}"
 )
 
 # ─────────────────────────────────────────────────────────
@@ -82,7 +83,6 @@ PROIBIDO:
 # ─────────────────────────────────────────────────────────
 MAX_USUARIOS = 500
 
-# Cada entrada: {"system": str, "history": lista de turnos}
 historico_conversas: OrderedDict = OrderedDict()
 travas_usuario: dict = {}
 
@@ -107,16 +107,11 @@ def obter_sessao(user_id: int, nome: str) -> tuple:
 # CHAMADA DIRETA À API REST DO GEMINI (100% async, sem SDK)
 # ─────────────────────────────────────────────────────────
 async def chamar_gemini(sessao: dict, texto_usuario: str) -> str:
-    """
-    Chama a API REST do Gemini diretamente com httpx async.
-    ✅ FIX: Retry automático com backoff exponencial em caso de 429.
-    """
     sessao["history"].append({
         "role": "user",
         "parts": [{"text": texto_usuario}],
     })
 
-    # Mantém no máximo 40 turnos no histórico para não exceder tokens
     if len(sessao["history"]) > 40:
         sessao["history"] = sessao["history"][-40:]
 
@@ -137,21 +132,20 @@ async def chamar_gemini(sessao: dict, texto_usuario: str) -> str:
         },
     }
 
-    # ✅ FIX: Retry com backoff exponencial para erro 429 (rate limit)
     for tentativa in range(3):
         async with httpx.AsyncClient(timeout=25.0) as client:
             resp = await client.post(GEMINI_URL, json=payload)
 
         if resp.status_code == 429:
             espera = (2 ** tentativa) * 10  # 10s → 20s → 40s
-            logger.warning(f"Rate limit 429 — aguardando {espera}s antes de tentar novamente (tentativa {tentativa + 1}/3)")
+            logger.warning(f"Rate limit 429 — aguardando {espera}s (tentativa {tentativa + 1}/3)")
             await asyncio.sleep(espera)
             continue
 
         resp.raise_for_status()
         break
     else:
-        raise Exception("Gemini indisponível após 3 tentativas por rate limit (429)")
+        raise Exception("Gemini indisponível após 3 tentativas (429)")
 
     data = resp.json()
     texto_resposta = data["candidates"][0]["content"]["parts"][0]["text"].strip()
@@ -195,7 +189,6 @@ async def simular_digitacao(
         action="typing",
     )
 
-    # ~3.5–5.5 chars/segundo (velocidade humana real)
     tempo_digitar = len(texto) / random.uniform(3.5, 5.5)
     await asyncio.sleep(max(1.0, min(tempo_digitar, 7.0)))
 
@@ -216,13 +209,11 @@ async def lidar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not texto:
         return
 
-    # Trava: evita processamento paralelo para o mesmo usuário
     if travas_usuario.get(user_id, False):
         return
     travas_usuario[user_id] = True
 
     try:
-        # ── Verificação de assinatura ────────────────────────────────
         if not verificar_assinatura(user_id):
             link_compra = "https://t.me/soualarinha_bot"
             await update.message.reply_text(
@@ -278,30 +269,62 @@ async def lidar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ─────────────────────────────────────────────────────────
+# HANDLER DE ERRO GLOBAL — captura Conflict (409) do Railway
+# ─────────────────────────────────────────────────────────
+async def handler_erro_global(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    erro = context.error
+    if isinstance(erro, Conflict):
+        # ✅ FIX: Railway sobe novo container antes de matar o antigo (rolling deploy).
+        # Aguardamos 20s para o container antigo morrer e então encerramos.
+        # O Railway reinicia o processo automaticamente, já sem conflito.
+        logger.warning("⚠️ Conflict 409 — Railway rolling deploy detectado. Aguardando 20s para restart limpo...")
+        await asyncio.sleep(20)
+        logger.info("🔄 Encerrando para restart limpo...")
+        sys.exit(0)
+    else:
+        logger.error(f"Erro global: {type(erro).__name__}: {erro}", exc_info=True)
+
+
+# ─────────────────────────────────────────────────────────
+# STARTUP: deleta webhook + aguarda deploy antigo encerrar
+# ─────────────────────────────────────────────────────────
+async def on_startup(app: Application) -> None:
+    # Deleta webhook ativo para liberar polling
+    await app.bot.delete_webhook(drop_pending_updates=True)
+    logger.info("✅ Webhook deletado — polling liberado")
+
+    # ✅ FIX: Delay de startup para o Railway encerrar o container antigo
+    # antes do novo começar a fazer polling (evita 409 no início)
+    startup_delay = int(os.getenv("STARTUP_DELAY", "12"))
+    if startup_delay > 0:
+        logger.info(f"⏳ Aguardando {startup_delay}s (Railway rolling deploy)...")
+        await asyncio.sleep(startup_delay)
+        logger.info("✅ Pronto para receber mensagens")
+
+
+# ─────────────────────────────────────────────────────────
 # INICIALIZAÇÃO
 # ─────────────────────────────────────────────────────────
-
-# ✅ FIX: Deleta webhook antes de iniciar o polling (evita erro 409 Conflict)
-async def on_startup(app: Application) -> None:
-    await app.bot.delete_webhook(drop_pending_updates=True)
-    logger.info("✅ Webhook deletado — polling liberado sem conflito")
-
-
 def main() -> None:
-    # ✅ FIX: Lock de arquivo para garantir instância única (evita 409 em caso
-    # de restart duplo ou deploy sobreposto no Railway)
+    # Lock de arquivo: impede duas instâncias no mesmo host
     lock_file = open("/tmp/lara_bot.lock", "w")
     try:
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except IOError:
-        logger.error("❌ Outra instância já está rodando. Encerrando para evitar conflito 409.")
+        logger.error("❌ Outra instância rodando neste host. Encerrando.")
         sys.exit(1)
 
     logger.info("=" * 45)
     logger.info("  LARA VIRTUAL — SISTEMA ATIVADO 🚀")
     logger.info("=" * 45)
 
-    app = Application.builder().token(TOKEN_BOT).post_init(on_startup).build()
+    app = (
+        Application.builder()
+        .token(TOKEN_BOT)
+        .post_init(on_startup)
+        .build()
+    )
+
     app.add_handler(
         MessageHandler(
             filters.TEXT
@@ -311,6 +334,10 @@ def main() -> None:
             lidar,
         )
     )
+
+    # ✅ FIX: captura Conflict globalmente e faz restart limpo
+    app.add_error_handler(handler_erro_global)
+
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
