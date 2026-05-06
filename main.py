@@ -28,8 +28,8 @@ if not CHAVE_GROQ:
     raise EnvironmentError("❌ CHAVE_GROQ não definida nas variáveis de ambiente.")
 
 # ✅ Groq — gratuito, rápido, sem quota zerada
+GROQ_URL   = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = "llama-3.3-70b-versatile"
-GROQ_MODEL = "llama3-70b-8192"
 
 # ─────────────────────────────────────────────────────────
 # PERSONALIDADE DA LARA
