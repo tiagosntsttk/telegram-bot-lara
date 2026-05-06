@@ -369,30 +369,9 @@ async def delay_humano(
     mood: int,
     minutos_ausente: float,
 ) -> None:
-    chars = len(texto_usuario)
-
-    eh_conflito = (
-        minutos_ausente >= 30
-        or mood == 5
-        or any(w in texto_usuario.lower() for w in [
-            "outra", "outras", "amiga", "amigo", "festa",
-            "beber", "ex", "crush", "beijo", "ficar", "sair"
-        ])
-    )
-
-    if eh_conflito or chars > 150:
-        delay_total = random.uniform(40.0, 60.0)
-        logger.info(f"⏳ Delay conflito: {delay_total:.1f}s")
-    elif chars > 60:
-        delay_total = random.uniform(15.0, 35.0)
-        logger.info(f"⏳ Delay médio: {delay_total:.1f}s")
-    else:
-        delay_total = random.uniform(2.0, 12.0)
-        if random.random() < 0.20:
-            delay_total = random.uniform(35.0, 55.0)
-            logger.info(f"⏳ Delay distração: {delay_total:.1f}s")
-        else:
-            logger.info(f"⏳ Delay curto: {delay_total:.1f}s")
+    # Delay fixo entre 5 e 30 segundos, com typing contínuo visível
+    delay_total = random.uniform(5.0, 30.0)
+    logger.info(f"⏳ Delay: {delay_total:.1f}s")
 
     inicio = asyncio.get_event_loop().time()
     while True:
