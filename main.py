@@ -27,7 +27,7 @@ if not CHAVE_GEMINI:
 # URL direta da API REST do Gemini — sem SDK, zero conflito com asyncio
 GEMINI_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
-    f"gemini-1.5-flash:generateContent?key={CHAVE_GEMINI}"
+    f"gemini-2.0-flash:generateContent?key={CHAVE_GEMINI}"
 )
 
 # ─────────────────────────────────────────────────────────
