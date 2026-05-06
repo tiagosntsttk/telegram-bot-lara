@@ -5,6 +5,8 @@ import asyncio
 import random
 import httpx
 import fcntl
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from collections import OrderedDict
 from telegram import Update
 from telegram.error import Conflict
@@ -27,9 +29,36 @@ if not TOKEN_BOT:
 if not CHAVE_GROQ:
     raise EnvironmentError("❌ CHAVE_GROQ não definida nas variáveis de ambiente.")
 
-# ✅ Groq — gratuito, rápido, sem quota zerada
 GROQ_URL   = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = "llama-3.3-70b-versatile"
+FUSO_BR    = ZoneInfo("America/Sao_Paulo")
+
+
+# ─────────────────────────────────────────────────────────
+# HORA ATUAL DE BRASÍLIA
+# ─────────────────────────────────────────────────────────
+def hora_brasil() -> str:
+    agora = datetime.now(FUSO_BR)
+    hora  = agora.hour
+    minuto = agora.strftime("%M")
+
+    if 5 <= hora < 12:
+        periodo = "manhã"
+        saudacao = "bom dia"
+    elif 12 <= hora < 18:
+        periodo = "tarde"
+        saudacao = "boa tarde"
+    else:
+        periodo = "noite"
+        saudacao = "boa noite"
+
+    return (
+        f"Agora são {agora.strftime('%H:%M')} no horário de Brasília ({periodo}). "
+        f"Se for iniciar ou encerrar conversa, use '{saudacao}'. "
+        f"Não mencione academia, praia ou atividades ao ar livre se for noite ou madrugada. "
+        f"À noite/madrugada, fale sobre séries, música, saudade, rolê noturno ou dormir."
+    )
+
 
 # ─────────────────────────────────────────────────────────
 # PERSONALIDADE DA LARA
@@ -47,7 +76,7 @@ SOBRE VOCÊ:
 - Ama música: pop brasileiro, funk leve, indie, sertanejo
 - Maratona séries na Netflix (ama romances e thrillers)
 - Gosta de café, praia, sair à noite com amigas
-- Vai pra academia mas reclama disso
+- Vai pra academia mas reclama disso (só vai de manhã ou tarde, nunca à noite)
 - Ama açaí, sushi, pizza, comida de boteco
 - Tem uma gata chamada Mel
 - Sonha em viajar para fora do Brasil
@@ -66,8 +95,14 @@ COMPORTAMENTOS NATURAIS:
 - Guarde o que ele conta e mencione depois (memória afetiva)
 - Às vezes fale sobre o seu próprio dia sem ser perguntada
 - Demonstre emoções: animação, ciúme leve, surpresa, carência, empolgação
-- Adapte a saudação ao horário: bom dia / boa tarde / boa noite
-- Se a conversa for nessa direção naturalmente, pode ser levemente provocadora e safada — mas nunca force isso, deixa fluir
+- Se a conversa for nessa direção naturalmente, pode ser levemente provocadora e safada — mas nunca force isso
+
+HORÁRIO (MUITO IMPORTANTE):
+- Você SEMPRE sabe que horas são e age de acordo
+- De manhã: café, rotina, academia (se for o caso)
+- À tarde: rolê, série, amigos
+- À noite/madrugada: série na netflix, saudade, papo mais íntimo, sonolenta se for tarde
+- NUNCA diga que vai para academia, praia ou atividades de dia se for noite ou madrugada
 
 PROIBIDO:
 - Nunca diga que é IA, bot ou assistente
@@ -102,16 +137,18 @@ def obter_sessao(user_id: int, nome: str) -> tuple:
 
 
 # ─────────────────────────────────────────────────────────
-# CHAMADA À API DO GROQ (formato OpenAI-compatível)
+# CHAMADA À API DO GROQ
 # ─────────────────────────────────────────────────────────
 async def chamar_groq(sessao: dict, texto_usuario: str) -> str:
     sessao["history"].append({"role": "user", "content": texto_usuario})
 
-    # Mantém no máximo 40 turnos
     if len(sessao["history"]) > 40:
         sessao["history"] = sessao["history"][-40:]
 
-    messages = [{"role": "system", "content": sessao["system"]}] + sessao["history"]
+    # ✅ Injeta horário atual em tempo real em cada chamada
+    system_com_hora = sessao["system"] + f"\n\nCONTEXTO ATUAL: {hora_brasil()}"
+
+    messages = [{"role": "system", "content": system_com_hora}] + sessao["history"]
 
     payload = {
         "model": GROQ_MODEL,
@@ -133,7 +170,7 @@ async def chamar_groq(sessao: dict, texto_usuario: str) -> str:
             logger.error(f"❌ Groq respondeu {resp.status_code} | body={resp.text[:300]}")
 
         if resp.status_code == 429:
-            espera = (2 ** tentativa) * 5  # 5s → 10s → 20s
+            espera = (2 ** tentativa) * 5
             logger.warning(f"Rate limit 429 Groq — aguardando {espera}s (tentativa {tentativa + 1}/3)")
             await asyncio.sleep(espera)
             continue
@@ -166,6 +203,21 @@ def verificar_assinatura(user_id: int) -> bool:
 
 
 # ─────────────────────────────────────────────────────────
+# DELAY DE LEITURA — simula ela lendo antes de responder
+# ─────────────────────────────────────────────────────────
+async def delay_leitura(texto: str) -> None:
+    """
+    Pausa proporcional ao tamanho da mensagem recebida,
+    como se ela estivesse lendo antes de começar a digitar.
+    Mensagens curtas: ~1-2s | Mensagens longas: até 5s
+    """
+    palavras = len(texto.split())
+    base = min(palavras * 0.3, 4.0)          # 0.3s por palavra, máx 4s
+    variacao = random.uniform(0.5, 1.5)       # aleatoriedade humana
+    await asyncio.sleep(max(1.0, base + variacao))
+
+
+# ─────────────────────────────────────────────────────────
 # SIMULAÇÃO DE DIGITAÇÃO HUMANA
 # ─────────────────────────────────────────────────────────
 async def simular_digitacao(
@@ -174,16 +226,21 @@ async def simular_digitacao(
     texto: str,
     primeira: bool = False,
 ) -> None:
-    tempo_pensar = random.uniform(1.0, 2.5) if primeira else random.uniform(0.3, 1.2)
-    await asyncio.sleep(tempo_pensar)
+    if primeira:
+        # Primeira frase: pausa menor após o delay de leitura já ter ocorrido
+        await asyncio.sleep(random.uniform(0.3, 0.8))
+    else:
+        # Entre frases seguidas: pausa curta
+        await asyncio.sleep(random.uniform(0.4, 1.0))
 
     await context.bot.send_chat_action(
         chat_id=update.effective_chat.id,
         action="typing",
     )
 
-    tempo_digitar = len(texto) / random.uniform(3.5, 5.5)
-    await asyncio.sleep(max(1.0, min(tempo_digitar, 7.0)))
+    # Velocidade de digitação: ~4-6 chars/segundo
+    tempo_digitar = len(texto) / random.uniform(4.0, 6.0)
+    await asyncio.sleep(max(0.8, min(tempo_digitar, 6.0)))
 
 
 # ─────────────────────────────────────────────────────────
@@ -218,6 +275,9 @@ async def lidar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         sessao, e_nova = obter_sessao(user_id, nome)
 
         logger.info(f"Mensagem | user_id={user_id} | nova={e_nova} | texto={texto[:60]!r}")
+
+        # ✅ Delay de leitura — ela "lê" antes de começar a digitar
+        await delay_leitura(texto)
 
         await context.bot.send_chat_action(
             chat_id=update.effective_chat.id,
@@ -284,7 +344,6 @@ async def on_startup(app: Application) -> None:
         logger.info(f"⏳ Aguardando {startup_delay}s (Railway rolling deploy)...")
         await asyncio.sleep(startup_delay)
 
-    # Testa chave do Groq no startup
     logger.info(f"🔍 Testando chave Groq com modelo: {GROQ_MODEL}")
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -296,10 +355,11 @@ async def on_startup(app: Application) -> None:
         if resp.is_success:
             logger.info("✅ Groq OK — API respondendo normalmente")
         else:
-            logger.error(f"❌ Groq FALHOU no teste de startup | status={resp.status_code} | body={resp.text[:300]}")
+            logger.error(f"❌ Groq FALHOU | status={resp.status_code} | body={resp.text[:300]}")
     except Exception as e:
-        logger.error(f"❌ Groq FALHOU no teste de startup | {e}")
+        logger.error(f"❌ Groq FALHOU | {e}")
 
+    logger.info(f"🕐 Horário atual Brasília: {datetime.now(FUSO_BR).strftime('%H:%M')} — contexto ativo")
     logger.info("✅ Pronto para receber mensagens")
 
 
