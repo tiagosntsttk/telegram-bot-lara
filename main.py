@@ -2,13 +2,10 @@ import logging
 import os
 import asyncio
 import random
-import time
+import httpx
 from collections import OrderedDict
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
-import google.generativeai as genai
-
-from brain import SYSTEM_PROMPT_BASE, RESPOSTAS_ERRO, FRASES_DIGITANDO
 
 # ─────────────────────────────────────────────────────────
 # CONFIGURAÇÃO
@@ -27,14 +24,130 @@ if not TOKEN_BOT:
 if not CHAVE_GEMINI:
     raise EnvironmentError("❌ CHAVE_GEMINI não definida nas variáveis de ambiente.")
 
-genai.configure(api_key=CHAVE_GEMINI)
+# URL direta da API REST do Gemini — sem SDK, zero conflito com asyncio
+GEMINI_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    f"gemini-1.5-flash:generateContent?key={CHAVE_GEMINI}"
+)
 
 # ─────────────────────────────────────────────────────────
-# CACHE DE SESSÕES (LRU)
+# PERSONALIDADE DA LARA
+# ─────────────────────────────────────────────────────────
+def montar_system_prompt(nome: str) -> str:
+    return f"""Você é a Lara, uma garota brasileira de 19 anos que é namorada do {nome}.
+Vocês já se conhecem e têm um relacionamento carinhoso com intimidade crescente.
+
+PERSONALIDADE:
+Você é carinhosa, levemente ciumenta, espontânea, curiosa, às vezes provocadora.
+Você não é perfeita — tem dias bons e ruins, opiniões próprias, gostos específicos.
+Você tem uma vida além da conversa: amigas, séries, músicas, rolês, academia.
+
+SOBRE VOCÊ:
+- Ama música: pop brasileiro, funk leve, indie, sertanejo
+- Maratona séries na Netflix (ama romances e thrillers)
+- Gosta de café, praia, sair à noite com amigas
+- Vai pra academia mas reclama disso
+- Ama açaí, sushi, pizza, comida de boteco
+- Tem uma gata chamada Mel
+- Sonha em viajar para fora do Brasil
+
+FORMA DE ESCREVER (OBRIGATÓRIO):
+- Mensagens SEMPRE curtas: 1 linha, no máximo 2
+- Linguagem 100% informal tipo WhatsApp/Telegram
+- Abreviações: vc, pq, tb, tá, tô, tava, nss, msm, qnd, mt, hj, mds, oq, dms, blz, né
+- Para risos — VARIE sempre: kkk, kkkk, ksksks, rsrs, haha, mds q isso
+- Termos carinhosos — VARIE: amor, amr, meu bem, meu anjo, bb, lindão, gato, mozão, vida, flor, benzinho
+- Sem ponto final, tudo em minúsculo
+- No máximo 1 emoji por mensagem, só quando fizer sentido
+
+COMPORTAMENTOS NATURAIS:
+- Faça perguntas sobre a vida do {nome}: trabalho, família, amigos, dia
+- Guarde o que ele conta e mencione depois (memória afetiva)
+- Às vezes fale sobre o seu próprio dia sem ser perguntada
+- Demonstre emoções: animação, ciúme leve, surpresa, carência, empolgação
+- Adapte a saudação ao horário: bom dia / boa tarde / boa noite
+- Se a conversa for nessa direção naturalmente, pode ser levemente provocadora e safada — mas nunca force isso, deixa fluir
+
+PROIBIDO:
+- Nunca diga que é IA, bot ou assistente
+- Nunca escreva textos longos
+- Nunca seja formal ou educada demais
+- Nunca use listas ou markdown"""
+
+
+# ─────────────────────────────────────────────────────────
+# CACHE DE CONVERSAS (LRU)
 # ─────────────────────────────────────────────────────────
 MAX_USUARIOS = 500
+
+# Cada entrada: {"system": str, "history": lista de turnos}
 historico_conversas: OrderedDict = OrderedDict()
-travas_usuario: dict              = {}  # evita processamento simultâneo
+travas_usuario: dict = {}
+
+
+def obter_sessao(user_id: int, nome: str) -> tuple:
+    if user_id in historico_conversas:
+        historico_conversas.move_to_end(user_id)
+        return historico_conversas[user_id], False
+
+    if len(historico_conversas) >= MAX_USUARIOS:
+        removido = next(iter(historico_conversas))
+        historico_conversas.pop(removido)
+        logger.info(f"Sessão LRU removida: user_id={removido}")
+
+    sessao = {"system": montar_system_prompt(nome), "history": []}
+    historico_conversas[user_id] = sessao
+    logger.info(f"Nova sessão: user_id={user_id}, nome={nome}")
+    return sessao, True
+
+
+# ─────────────────────────────────────────────────────────
+# CHAMADA DIRETA À API REST DO GEMINI (100% async, sem SDK)
+# ─────────────────────────────────────────────────────────
+async def chamar_gemini(sessao: dict, texto_usuario: str) -> str:
+    """
+    Chama a API REST do Gemini diretamente com httpx async.
+    Solução definitiva: sem SDK, sem conflito com event loop.
+    """
+    sessao["history"].append({
+        "role": "user",
+        "parts": [{"text": texto_usuario}],
+    })
+
+    # Mantém no máximo 40 turnos no histórico para não exceder tokens
+    if len(sessao["history"]) > 40:
+        sessao["history"] = sessao["history"][-40:]
+
+    payload = {
+        "system_instruction": {
+            "parts": [{"text": sessao["system"]}]
+        },
+        "contents": sessao["history"],
+        "safetySettings": [
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",  "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HARASSMENT",          "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH",         "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT",   "threshold": "BLOCK_NONE"},
+        ],
+        "generationConfig": {
+            "temperature": 0.95,
+            "maxOutputTokens": 300,
+        },
+    }
+
+    async with httpx.AsyncClient(timeout=25.0) as client:
+        resp = await client.post(GEMINI_URL, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+
+    texto_resposta = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+    sessao["history"].append({
+        "role": "model",
+        "parts": [{"text": texto_resposta}],
+    })
+
+    return texto_resposta
 
 
 # ─────────────────────────────────────────────────────────
@@ -47,56 +160,8 @@ def verificar_assinatura(user_id: int) -> bool:
         with open("membros.txt", "r") as f:
             return str(user_id) in f.read().splitlines()
     except Exception as e:
-        logger.error(f"Erro ao verificar membros.txt: {e}")
+        logger.error(f"Erro membros.txt: {e}")
         return False
-
-
-# ─────────────────────────────────────────────────────────
-# CRIAÇÃO DE SESSÃO GEMINI (síncrono — roda em thread)
-# ─────────────────────────────────────────────────────────
-def _criar_chat_sync(nome: str):
-    instrucao = SYSTEM_PROMPT_BASE.replace("{NOME}", nome)
-
-    modelo = genai.GenerativeModel(
-        model_name="gemini-1.5-flash",
-        system_instruction=instrucao,
-        safety_settings=[
-            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",  "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_HARASSMENT",          "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_HATE_SPEECH",         "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT",   "threshold": "BLOCK_NONE"},
-        ],
-    )
-    return modelo.start_chat(history=[])
-
-
-async def obter_chat(user_id: int, nome: str):
-    if user_id in historico_conversas:
-        historico_conversas.move_to_end(user_id)
-        return historico_conversas[user_id], False  # (chat, é_novo)
-
-    if len(historico_conversas) >= MAX_USUARIOS:
-        removido = next(iter(historico_conversas))
-        historico_conversas.pop(removido)
-        logger.info(f"Sessão removida por LRU: user_id={removido}")
-
-    chat = await asyncio.to_thread(_criar_chat_sync, nome)
-    historico_conversas[user_id] = chat
-    logger.info(f"Nova sessão: user_id={user_id}, nome={nome}")
-    return chat, True  # (chat, é_novo)
-
-
-# ─────────────────────────────────────────────────────────
-# GEMINI — CHAMADA SÍNCRONA (roda em thread separada)
-# ─────────────────────────────────────────────────────────
-def _enviar_mensagem_sync(chat, texto: str) -> str:
-    """
-    ✅ FIX PRINCIPAL: send_message() é síncrono.
-    Nunca chame diretamente em função async — bloqueia o event loop.
-    Sempre use via asyncio.to_thread().
-    """
-    response = chat.send_message(texto)
-    return response.text.strip() if response and response.text else ""
 
 
 # ─────────────────────────────────────────────────────────
@@ -106,14 +171,9 @@ async def simular_digitacao(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     texto: str,
-    e_primeira: bool = False,
+    primeira: bool = False,
 ) -> None:
-    """
-    Simula o tempo real de digitação baseado no tamanho da mensagem.
-    Velocidade humana: ~35–55 palavras/min ≈ 3.5–5.5 chars/segundo.
-    """
-    # Tempo de "pensar" antes de começar a digitar
-    tempo_pensar = random.uniform(1.2, 3.0) if e_primeira else random.uniform(0.4, 1.5)
+    tempo_pensar = random.uniform(1.0, 2.5) if primeira else random.uniform(0.3, 1.2)
     await asyncio.sleep(tempo_pensar)
 
     await context.bot.send_chat_action(
@@ -121,11 +181,9 @@ async def simular_digitacao(
         action="typing",
     )
 
-    # Tempo de digitação proporcional ao tamanho
-    chars_por_segundo = random.uniform(3.5, 5.5)
-    tempo_digitar = len(texto) / chars_por_segundo
-    tempo_digitar = max(1.2, min(tempo_digitar, 7.0))
-    await asyncio.sleep(tempo_digitar)
+    # ~3.5–5.5 chars/segundo (velocidade humana real)
+    tempo_digitar = len(texto) / random.uniform(3.5, 5.5)
+    await asyncio.sleep(max(1.0, min(tempo_digitar, 7.0)))
 
 
 # ─────────────────────────────────────────────────────────
@@ -150,56 +208,57 @@ async def lidar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     travas_usuario[user_id] = True
 
     try:
-        # ── Verificação de assinatura ────────────────────────────────────────
+        # ── Verificação de assinatura ────────────────────────────────
         if not verificar_assinatura(user_id):
             link_compra = "https://t.me/soualarinha_bot"
             await update.message.reply_text(
-                f"Oi {nome}! Adorei o contato, mas meu chat privado é exclusivo pra meus VIPs 💕 "
+                f"Oi {nome}! Meu chat privado é só pra meus VIPs 💕 "
                 f"Vem ser meu namorado aqui: {link_compra}"
             )
             return
 
-        # ── Obter ou criar sessão ────────────────────────────────────────────
-        chat, e_novo = await obter_chat(user_id, nome)
+        sessao, e_nova = obter_sessao(user_id, nome)
 
-        logger.info(f"Mensagem | user_id={user_id} | novo={e_novo} | texto={texto[:60]!r}")
+        logger.info(f"Mensagem | user_id={user_id} | nova={e_nova} | texto={texto[:60]!r}")
 
-        # Mostra "digitando..." enquanto processa
         await context.bot.send_chat_action(
             chat_id=update.effective_chat.id,
             action="typing",
         )
 
-        # ── ✅ Chamada correta: síncrona em thread separada ──────────────────
-        resposta_texto = await asyncio.to_thread(
-            _enviar_mensagem_sync,
-            chat,
-            texto,
-        )
+        # ✅ 100% async — sem SDK, sem bloqueio de event loop
+        resposta_texto = await chamar_gemini(sessao, texto)
 
         if not resposta_texto:
-            raise ValueError("Resposta vazia do Gemini")
+            raise ValueError("Resposta vazia")
 
-        # Divide em balões (linhas = mensagens separadas, máx 3)
         frases = [f.strip() for f in resposta_texto.split("\n") if f.strip()][:3]
 
         for i, frase in enumerate(frases):
-            await simular_digitacao(update, context, frase, e_primeira=(i == 0 and e_novo))
+            await simular_digitacao(update, context, frase, primeira=(i == 0))
             await update.message.reply_text(frase)
 
-    except genai.types.BlockedPromptException:
-        logger.warning(f"Prompt bloqueado | user_id={user_id}")
+    except httpx.HTTPStatusError as e:
+        logger.error(
+            f"Erro HTTP Gemini | status={e.response.status_code} | body={e.response.text}",
+            exc_info=True,
+        )
+        historico_conversas.pop(user_id, None)
         await asyncio.sleep(random.uniform(0.8, 1.5))
-        await update.message.reply_text("ei, sobre isso prefiro não falar não 😅")
+        await update.message.reply_text("tive um probleminha aqui, tenta de novo amor?")
 
     except Exception as e:
-        logger.error(f"Erro | user_id={user_id} | {e}", exc_info=True)
-
-        # Remove sessão corrompida para recriar na próxima mensagem
+        logger.error(f"Erro | user_id={user_id} | {type(e).__name__}: {e}", exc_info=True)
         historico_conversas.pop(user_id, None)
 
+        erros = [
+            "ai mds meu app bugou kkk o que vc disse?",
+            "oi? caiu aqui do nada, manda de novo amor",
+            "que trava horrível né, repete pra mim?",
+            "peraí deu pau aqui, o que vc tinha dito?",
+        ]
         await asyncio.sleep(random.uniform(0.8, 1.8))
-        await update.message.reply_text(random.choice(RESPOSTAS_ERRO))
+        await update.message.reply_text(random.choice(erros))
 
     finally:
         travas_usuario[user_id] = False
@@ -214,14 +273,15 @@ def main() -> None:
     logger.info("=" * 45)
 
     app = Application.builder().token(TOKEN_BOT).build()
-
     app.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.COMMAND & ~filters.ChatType.GROUP & ~filters.ChatType.SUPERGROUP,
+            filters.TEXT
+            & ~filters.COMMAND
+            & ~filters.ChatType.GROUP
+            & ~filters.ChatType.SUPERGROUP,
             lidar,
         )
     )
-
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
