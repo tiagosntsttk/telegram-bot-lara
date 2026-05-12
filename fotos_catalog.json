@@ -1,0 +1,12 @@
+{
+  "manha":     ["fotos/manha/manha_01.jpg", "fotos/manha/manha_02.jpg"],
+  "tarde":     ["fotos/tarde/tarde_01.jpg"],
+  "noite":     ["fotos/noite/noite_01.jpg"],
+  "madrugada": ["fotos/madrugada/madu_01.jpg"],
+  "academia":  ["fotos/academia/gym_01.jpg"],
+  "praia":     ["fotos/praia/praia_01.jpg"],
+  "cafe":      ["fotos/cafe/cafe_01.jpg"],
+  "casa":      ["fotos/casa/casa_01.jpg"],
+  "saindo":    ["fotos/saindo/saindo_01.jpg"],
+  "romantica": ["fotos/romantica/rom_01.jpg"]
+}
